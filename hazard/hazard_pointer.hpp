@@ -87,11 +87,11 @@ class hazard_pointer {
             #if defined(__x86_64__) || defined(_M_X64)
             _mm_pause();
             #elif defined(__aarch64__)
-            // i dont really have iphone to test this, but it should work
+            asm volatile("isb" ::: "memory"); // TODO: check this!
+            #elif defined(__arm__)
             __asm__ __volatile__("yield");
-            #else
-            std::this_thread::yield();
             #endif
+            // ignore relax
         }
         return ptr;
     }
