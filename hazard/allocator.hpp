@@ -6,6 +6,7 @@
 #include <algorithm>
 
 namespace conc {
+constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;
 
 template <class T> class cache_aligned_alloc {
     static inline constexpr std::size_t CACHELINE_SIZE = std::hardware_destructive_interference_size;

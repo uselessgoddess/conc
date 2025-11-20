@@ -1,23 +1,29 @@
+#pragma once
+
 #include "domain.hpp"
 #include <atomic>
+#include <cassert>
 #include <cstddef>
+#include <thread>
+#include <utility>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <xmmintrin.h>
+#endif
 
 namespace conc {
-
 template<typename T>
 using default_domain = hazard_domain<T>;
 
 template <typename T, typename domain = default_domain<T>>
 requires(std::is_nothrow_destructible_v<T>)
 class hazard_pointer {
-   private:
-    hazard_pointer(domain_cell<T>* cell) noexcept {
-        this->m_cell = cell;
-    }
+    explicit hazard_pointer(domain_cell<T>* cell) noexcept : m_cell(cell) {}
 
    public:
-    static hazard_pointer<T, domain> make_hazard_pointer() noexcept {
-        return hazard_pointer<T, domain>(s_domain.capture_cell());
+    [[nodiscard]]
+    static hazard_pointer make_hazard_pointer() noexcept {
+        return hazard_pointer(s_domain.capture_cell());
     }
 
     static void retire(T* data) {
@@ -28,93 +34,103 @@ class hazard_pointer {
         guard() = delete;
         guard(const guard&) = delete;
         guard(guard&&) = delete;
-        guard& operator=(const guard&) = delete;
-        guard& operator=(guard&&) = delete;
 
-        guard(T*& hz_obj) noexcept :
-            hazard_obj_ptr(std::addressof(hz_obj)) {}
+        explicit guard(hazard_pointer& hp, const std::atomic<T*>& src) noexcept
+            : m_hp(hp), m_ptr(hp.protect(src)) {}
+
         ~guard() {
-            [[likely]]
-            if(*hazard_obj_ptr != nullptr) {
-                retire(*hazard_obj_ptr);
-            }
+            m_hp.reset_protection();
         }
 
+        T* get() const noexcept { return m_ptr; }
+        T* operator->() const noexcept { return m_ptr; }
+        T& operator*() const noexcept { return *m_ptr; }
+        explicit operator bool() const noexcept { return m_ptr != nullptr; }
+
        private:
-        T** hazard_obj_ptr = nullptr;
+        hazard_pointer& m_hp;
+        T* m_ptr;
     };
 
-   public:
     hazard_pointer() noexcept = default;
 
-    hazard_pointer(hazard_pointer&& hp) noexcept {
-        swap(hp);
-    }
+    hazard_pointer(hazard_pointer&& hp) noexcept : m_cell(std::exchange(hp.m_cell, nullptr)) {}
 
     hazard_pointer& operator=(hazard_pointer&& hp) noexcept {
-        swap(hp);
-        hp.reset_protection();
+        if (this != &hp) {
+            if (m_cell) {
+                s_domain.release_cell(m_cell);
+            }
+            m_cell = std::exchange(hp.m_cell, nullptr);
+        }
         return *this;
     }
 
     ~hazard_pointer() {
-        if(m_cell != nullptr) {
-            reset_protection();
+        if (m_cell) {
+            s_domain.release_cell(m_cell);
         }
     }
 
-   public:
-    [[nodiscard]] 
+    [[nodiscard]]
     bool empty() const noexcept {
-        return m_cell->pointer == nullptr;
+        if (!m_cell)
+            return true;
+        auto* ptr = m_cell->pointer.load(std::memory_order_relaxed);
+
+        return ptr == nullptr || ptr == domain::reserved::reset();
     }
 
     T* protect(const std::atomic<T*>& src) noexcept {
-        T* ptr = src.load(std::memory_order::relaxed);
-        while (!try_protect(ptr, src)) {}
+        auto* ptr = src.load(std::memory_order_relaxed);
+        while (!try_protect(ptr, src)) {
+            #if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+            #elif defined(__aarch64__)
+            asm volatile("isb" ::: "memory"); // TODO: check this!
+            #elif defined(__arm__)
+            __asm__ __volatile__("yield");
+            #endif
+            // ignore relax
+        }
         return ptr;
     }
 
     bool try_protect(T*& ptr, const std::atomic<T*>& src) noexcept {
-        assert(this->m_cell != nullptr);
-        auto old = ptr;
-        reset_protection(old);
+        assert(m_cell != nullptr);
 
-        ptr = src.load(std::memory_order_acquire);
+        m_cell->pointer.store(ptr, std::memory_order_seq_cst);
 
-        auto result = (old == ptr);
-        if(!result) {
-            reset_protection();
+        auto* current = src.load(std::memory_order_acquire);
+        if (current == ptr) {
+            return true;
         }
 
-        return result;
+        m_cell->pointer.store(domain::reserved::reset(), std::memory_order_release);
+        ptr = current;
+        return false;
+    }
+
+    void reset_protection() noexcept {
+        assert(m_cell != nullptr);
+        m_cell->pointer.store(domain::reserved::reset(), std::memory_order_release);
     }
 
     void reset_protection(T* ptr) noexcept {
-        assert(this->m_cell != nullptr);
-        if(ptr == nullptr) {
-            reset_protection();
-            return;
-        }
-
-        m_cell->pointer.store(ptr, std::memory_order_release);
+        assert(m_cell != nullptr);
+        m_cell->pointer.store(ptr, std::memory_order_seq_cst);
     }
 
-    void reset_protection(std::nullptr_t t = nullptr) noexcept {
-        assert(this->m_cell != nullptr);
-        m_cell->pointer.store(t, std::memory_order_release);
+    void reset_protection(std::nullptr_t) noexcept {
+        reset_protection();
     }
-
-
-    template<typename T_, typename domain_>
-    friend void swap(hazard_pointer<T_, domain_>& t1, hazard_pointer<T_, domain_>& t2) noexcept;
 
     void swap(hazard_pointer& t) noexcept {
         std::swap(m_cell, t.m_cell);
     }
 
    private:
-    inline static domain s_domain = domain();
+    inline static auto s_domain = domain();
     domain_cell<T>* m_cell = nullptr;
 };
 
@@ -122,6 +138,4 @@ template<typename T, typename domain>
 void swap(hazard_pointer<T, domain>& t1, hazard_pointer<T, domain>& t2) noexcept {
     t1.swap(t2);
 }
-
 }
-
